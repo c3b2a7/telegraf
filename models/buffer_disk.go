@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -40,17 +41,11 @@ type DiskBuffer struct {
 	mask []int
 }
 
-func NewDiskBuffer(name, id, path string, stats BufferStats) (*DiskBuffer, error) {
+func NewDiskBuffer(id, path string, stats BufferStats) (*DiskBuffer, error) {
 	filePath := filepath.Join(path, id)
 	walFile, err := wal.Open(filePath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal file: %w", err)
-	}
-	//nolint:errcheck // cannot error here
-	if index, _ := walFile.FirstIndex(); index == 0 {
-		// simple way to test if the walfile is freshly initialized, meaning no existing file was found
-		log.Printf("I! WAL file not found for plugin outputs.%s (%s), "+
-			"this can safely be ignored if you added this plugin instance for the first time", name, id)
 	}
 
 	buf := &DiskBuffer{
@@ -58,7 +53,7 @@ func NewDiskBuffer(name, id, path string, stats BufferStats) (*DiskBuffer, error
 		file:        walFile,
 		path:        filePath,
 	}
-	if buf.length() > 0 {
+	if buf.Len() > 0 {
 		buf.originalEnd = buf.writeIndex()
 	}
 	return buf, nil
@@ -124,12 +119,11 @@ func (b *DiskBuffer) addSingleMetric(m telegraf.Metric) bool {
 	if err != nil {
 		panic(err)
 	}
-	err = b.file.Write(b.writeIndex(), data)
-	if err == nil {
-		b.metricAdded()
-		return true
+	if err := b.file.Write(b.writeIndex(), data); err != nil {
+		return false
 	}
-	return false
+	b.metricAdded()
+	return true
 }
 
 func (b *DiskBuffer) BeginTransaction(batchSize int) *Transaction {
@@ -273,7 +267,20 @@ func (b *DiskBuffer) Stats() BufferStats {
 }
 
 func (b *DiskBuffer) Close() error {
-	return b.file.Close()
+	if err := b.file.Close(); err != nil {
+		return fmt.Errorf("closing buffer failed: %w", err)
+	}
+
+	// Remove all remaining data on disk to make sure we won't get any metric
+	// in cases where the buffer is empty. This is required because we cannot
+	// truncate all metrics from the buffer.
+	b.Lock()
+	defer b.Unlock()
+	if b.isEmpty {
+		return os.RemoveAll(b.path)
+	}
+
+	return nil
 }
 
 func (b *DiskBuffer) resetBatch() {
@@ -293,5 +300,6 @@ func (b *DiskBuffer) handleEmptyFile() {
 		log.Printf("E! readIndex: %d, buffer len: %d", b.readIndex(), b.length())
 		panic(err)
 	}
+	b.mask = b.mask[1:]
 	b.isEmpty = false
 }
